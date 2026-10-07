@@ -11,6 +11,7 @@
 #include <stdlib.h>
 #include <dlfcn.h>
 #include <libgen.h>
+#include <stdint.h>
 
 #include "libnetlink.h"
 #include "cr_options.h"
@@ -27,6 +28,7 @@
 #include "cr-service.h"
 #include "plugin.h"
 #include "namespaces.h"
+#include "net.h"
 #include "pstree.h"
 #include "external.h"
 #include "crtools.h"
@@ -34,6 +36,7 @@
 #include "fdinfo.h"
 #include "kerndat.h"
 #include "rst-malloc.h"
+#include "fault-injection.h"
 
 #include "protobuf.h"
 #include "images/sk-unix.pb-c.h"
@@ -63,6 +66,8 @@
 
 struct unix_sk_desc {
 	struct socket_desc sd;
+	uint64_t recovery_cookie;
+	bool diag_recovered;
 	unsigned int type;
 	unsigned int state;
 	unsigned int peer_ino;
@@ -323,6 +328,148 @@ err:
 	return -ENOENT;
 }
 
+#ifndef SOCK_DIAG_BY_FAMILY
+#define SOCK_DIAG_BY_FAMILY 20
+#endif
+
+static int unix_collect_one(const struct unix_diag_msg *m, struct nlattr **tb, struct ns_id *ns);
+
+struct unix_diag_query {
+	unsigned int inode;
+	unsigned int peer_inode;
+	uint64_t cookie;
+};
+
+static int receive_missing_unix_socket(struct nlmsghdr *header, struct ns_id *ns, void *arg)
+{
+	struct unix_diag_query *query = arg;
+	struct unix_diag_msg *reply = NLMSG_DATA(header);
+	struct nlattr *attributes[UNIX_DIAG_MAX + 1];
+	struct unix_sk_desc *sk;
+	uint64_t reply_cookie;
+	unsigned int reply_peer;
+
+	if (header->nlmsg_type != SOCK_DIAG_BY_FAMILY ||
+	    (header->nlmsg_flags & (NLM_F_MULTI | NLM_F_DUMP_INTR)) ||
+	    nlmsg_parse(header, sizeof(*reply), attributes, UNIX_DIAG_MAX, NULL) < 0)
+		return -1;
+	reply_cookie = (uint64_t)reply->udiag_cookie[0] | ((uint64_t)reply->udiag_cookie[1] << 32);
+	if (reply->udiag_family != AF_UNIX || reply->udiag_ino != query->inode ||
+	    reply->udiag_type != SOCK_SEQPACKET || reply->udiag_state != TCP_ESTABLISHED ||
+	    (!query->peer_inode && reply_cookie != query->cookie))
+		return -1;
+	if (attributes[UNIX_DIAG_NAME] || attributes[UNIX_DIAG_VFS] || attributes[UNIX_DIAG_ICONS] ||
+	    (attributes[UNIX_DIAG_PEER] && nla_len(attributes[UNIX_DIAG_PEER]) != sizeof(uint32_t)) ||
+	    !attributes[UNIX_DIAG_RQLEN] || nla_len(attributes[UNIX_DIAG_RQLEN]) != sizeof(struct unix_diag_rqlen) ||
+	    !attributes[UNIX_DIAG_SHUTDOWN] || nla_len(attributes[UNIX_DIAG_SHUTDOWN]) != sizeof(uint8_t))
+		return -1;
+	reply_peer = attributes[UNIX_DIAG_PEER] ? nla_get_u32(attributes[UNIX_DIAG_PEER]) : 0;
+	if ((!reply_peer && (query->peer_inode || nla_get_u8(attributes[UNIX_DIAG_SHUTDOWN]) != 3)) ||
+	    (query->peer_inode && reply_peer != query->peer_inode) || lookup_socket_ino(query->inode, AF_UNIX))
+		return -1;
+	if (unix_collect_one(reply, attributes, ns))
+		return -1;
+	sk = (struct unix_sk_desc *)lookup_socket_ino(query->inode, AF_UNIX);
+	if (!sk)
+		return -1;
+	sk->recovery_cookie = reply_cookie;
+	sk->diag_recovered = true;
+	pr_warn("Recovered omitted Unix socket %u peer %u netns %u via exact query\n",
+		query->inode, reply_peer, ns->kid);
+	return 0;
+}
+
+static int query_missing_unix_socket(int nl, unsigned int inode, uint64_t cookie,
+				     unsigned int peer_inode, struct ns_id *ns)
+{
+	struct unix_diag_query query = { .inode = inode, .peer_inode = peer_inode, .cookie = cookie };
+	struct {
+		struct nlmsghdr header;
+		struct unix_diag_req body;
+	} request = {
+		.header = {
+			.nlmsg_len = NLMSG_LENGTH(sizeof(struct unix_diag_req)),
+			.nlmsg_type = SOCK_DIAG_BY_FAMILY,
+			.nlmsg_flags = NLM_F_REQUEST | NLM_F_ACK,
+			.nlmsg_seq = CR_NLMSG_SEQ,
+		},
+		.body = {
+			.sdiag_family = AF_UNIX,
+			.udiag_states = UINT32_MAX,
+			.udiag_ino = inode,
+			.udiag_cookie = { peer_inode ? UINT32_MAX : (uint32_t)cookie,
+					  peer_inode ? UINT32_MAX : (uint32_t)(cookie >> 32) },
+			.udiag_show = UDIAG_SHOW_NAME | UDIAG_SHOW_VFS | UDIAG_SHOW_PEER |
+				      UDIAG_SHOW_ICONS | UDIAG_SHOW_RQLEN,
+		},
+	};
+
+	if (do_rtnl_req_timeout(nl, &request, sizeof(request), receive_missing_unix_socket, NULL, ns, &query, 2000))
+		return -1;
+	return lookup_socket_ino(inode, AF_UNIX) ? 0 : -1;
+}
+
+static int recover_missing_unix_socket(int lfd, unsigned int inode, unsigned int peer_inode)
+{
+	struct ns_id *ns;
+	struct stat socket_stat;
+	uint64_t cookie;
+	socklen_t length;
+	int type, namespace_fd, saved_namespace = -1, nl = -1, ret = -1;
+
+	length = sizeof(type);
+	if (getsockopt(lfd, SOL_SOCKET, SO_TYPE, &type, &length) || type != SOCK_SEQPACKET ||
+	    length != sizeof(type) || fstat(lfd, &socket_stat) || socket_stat.st_ino > UINT32_MAX ||
+	    (peer_inode ? peer_inode : inode) != socket_stat.st_ino)
+		return -1;
+	length = sizeof(cookie);
+	if (getsockopt(lfd, SOL_SOCKET, SO_COOKIE, &cookie, &length) || length != sizeof(cookie))
+		return -1;
+	ns = get_socket_ns(lfd);
+	if (!ns)
+		return -1;
+	namespace_fd = ioctl(lfd, SIOCGSKNS);
+	if (namespace_fd < 0)
+		return -1;
+	if (switch_ns_by_fd(namespace_fd, &net_ns_desc, &saved_namespace)) {
+		close(namespace_fd);
+		return -1;
+	}
+	close(namespace_fd);
+	nl = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_SOCK_DIAG);
+	ret = restore_ns(saved_namespace, &net_ns_desc);
+	if (ret || nl < 0)
+		ret = -1;
+	else
+		ret = query_missing_unix_socket(nl, inode, cookie, peer_inode, ns);
+	if (nl >= 0)
+		close(nl);
+	return ret;
+}
+
+static struct unix_sk_desc *lookup_unix_socket_for_dump(int lfd, unsigned int inode, unsigned int peer_inode)
+{
+	struct unix_sk_desc *sk;
+	uint64_t cookie;
+	socklen_t length = sizeof(cookie);
+
+	sk = (struct unix_sk_desc *)lookup_socket(inode, PF_UNIX, 0);
+	if (IS_ERR(sk))
+		return sk;
+	if (!sk) {
+		if (recover_missing_unix_socket(lfd, inode, peer_inode))
+			return NULL;
+		return (struct unix_sk_desc *)lookup_socket_ino(inode, PF_UNIX);
+	}
+	if (sk->diag_recovered && !peer_inode &&
+	    (getsockopt(lfd, SOL_SOCKET, SO_COOKIE, &cookie, &length) || length != sizeof(cookie) ||
+	     cookie != sk->recovery_cookie || get_socket_ns(lfd) != sk->sd.sk_ns)) {
+		pr_err("Recovered Unix socket %u does not match its held FD\n", inode);
+		return NULL;
+	}
+	return sk;
+}
+
 static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 {
 	struct unix_sk_desc *sk, *peer;
@@ -346,7 +493,7 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 
 	*fown = p->fown;
 
-	sk = (struct unix_sk_desc *)lookup_socket(p->stat.st_ino, PF_UNIX, 0);
+	sk = lookup_unix_socket_for_dump(lfd, p->stat.st_ino, 0);
 	if (IS_ERR_OR_NULL(sk)) {
 		pr_err("Unix socket %d not found\n", (int)p->stat.st_ino);
 		goto err;
@@ -413,7 +560,7 @@ static int dump_one_unix_fd(int lfd, uint32_t id, const struct fd_parms *p)
 	}
 
 	if (ue->peer) {
-		peer = (struct unix_sk_desc *)lookup_socket(ue->peer, PF_UNIX, 0);
+		peer = lookup_unix_socket_for_dump(lfd, ue->peer, ue->ino);
 		if (IS_ERR_OR_NULL(peer)) {
 			pr_err("Unix socket %u without peer %u\n", ue->ino, ue->peer);
 			goto err;
@@ -846,6 +993,19 @@ int unix_receive_one(struct nlmsghdr *h, struct ns_id *ns, void *arg)
 	struct nlattr *tb[UNIX_DIAG_MAX + 1];
 
 	nlmsg_parse(h, sizeof(struct unix_diag_msg), tb, UNIX_DIAG_MAX, NULL);
+
+	if (m->udiag_type == SOCK_SEQPACKET && m->udiag_state == TCP_ESTABLISHED &&
+	    !tb[UNIX_DIAG_NAME] && !tb[UNIX_DIAG_VFS] && !tb[UNIX_DIAG_ICONS]) {
+		unsigned int peer = tb[UNIX_DIAG_PEER] ? nla_get_u32(tb[UNIX_DIAG_PEER]) : 0;
+
+		if ((fault_injected(FI_UNIX_DIAG_OMIT) &&
+		     (peer || (tb[UNIX_DIAG_SHUTDOWN] && nla_get_u8(tb[UNIX_DIAG_SHUTDOWN]) == 3))) ||
+		    (fault_injected(FI_UNIX_DIAG_OMIT_PEER) && peer && m->udiag_ino > peer)) {
+			pr_warn("Fault injection: omitting Unix socket %u peer %u from bulk diagnostics\n",
+				m->udiag_ino, peer);
+			return 0;
+		}
+	}
 
 	return unix_collect_one(m, tb, ns);
 }

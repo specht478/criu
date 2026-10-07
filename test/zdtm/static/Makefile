@@ -85,6 +85,7 @@ TST_NOFILE	:=				\
 		sockets02-seqpacket		\
 		sockets_spair			\
 		sockets_spair_seqpacket		\
+		sk-unix-diag-recovery		\
 		socket_queues			\
 		socket_queues_seqpacket		\
 		socket-raw			\

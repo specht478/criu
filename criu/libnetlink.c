@@ -6,6 +6,8 @@
 #include <libnl3/netlink/msg.h>
 #include <string.h>
 #include <unistd.h>
+#include <poll.h>
+#include <time.h>
 
 #include "libnetlink.h"
 #include "util.h"
@@ -55,14 +57,66 @@ static int rtnl_return_err(int err, struct ns_id *ns, void *arg)
 	return err;
 }
 
-int do_rtnl_req(int nl, void *req, int size, int (*receive_callback)(struct nlmsghdr *h, struct ns_id *ns, void *),
-		int (*error_callback)(int err, struct ns_id *ns, void *arg), struct ns_id *ns, void *arg)
+static int rtnl_remaining_ms(const struct timespec *deadline)
+{
+	struct timespec now;
+	long long remaining;
+
+	if (clock_gettime(CLOCK_MONOTONIC, &now))
+		return -errno;
+	remaining = (deadline->tv_sec - now.tv_sec) * 1000000000LL + deadline->tv_nsec - now.tv_nsec;
+	if (remaining <= 0)
+		return -ETIMEDOUT;
+	return (remaining + 999999) / 1000000;
+}
+
+static int rtnl_wait(int nl, short events, const struct timespec *deadline)
+{
+	struct pollfd descriptor = { .fd = nl, .events = events };
+	int remaining, ready;
+
+	if (!deadline)
+		return 0;
+	for (;;) {
+		remaining = rtnl_remaining_ms(deadline);
+		if (remaining < 0)
+			return remaining;
+		ready = poll(&descriptor, 1, remaining);
+		if (ready > 0)
+			return 0;
+		if (!ready)
+			return -ETIMEDOUT;
+		if (errno != EINTR)
+			return -errno;
+	}
+}
+
+int do_rtnl_req_timeout(int nl, void *req, int size,
+			int (*receive_callback)(struct nlmsghdr *h, struct ns_id *ns, void *),
+			int (*error_callback)(int err, struct ns_id *ns, void *arg), struct ns_id *ns,
+			void *arg, int timeout_ms)
 {
 	struct msghdr msg;
 	struct sockaddr_nl nladdr;
 	struct iovec iov;
+	struct timespec expires, *deadline = NULL;
 	static char buf[16384];
-	int err;
+	int err, flags = 0;
+
+	if (timeout_ms < 0)
+		return -EINVAL;
+	if (timeout_ms) {
+		if (clock_gettime(CLOCK_MONOTONIC, &expires))
+			return -errno;
+		expires.tv_sec += timeout_ms / 1000;
+		expires.tv_nsec += (timeout_ms % 1000) * 1000000L;
+		if (expires.tv_nsec >= 1000000000L) {
+			expires.tv_sec++;
+			expires.tv_nsec -= 1000000000L;
+		}
+		deadline = &expires;
+		flags = MSG_DONTWAIT;
+	}
 
 	if (!error_callback)
 		error_callback = rtnl_return_err;
@@ -79,7 +133,14 @@ int do_rtnl_req(int nl, void *req, int size, int (*receive_callback)(struct nlms
 	iov.iov_base = req;
 	iov.iov_len = size;
 
-	if (sendmsg(nl, &msg, 0) < 0) {
+	for (;;) {
+		err = rtnl_wait(nl, POLLOUT, deadline);
+		if (err)
+			goto err;
+		if (sendmsg(nl, &msg, flags) >= 0)
+			break;
+		if (deadline && (errno == EINTR || errno == EAGAIN))
+			continue;
 		err = -errno;
 		pr_perror("Can't send request message");
 		goto err;
@@ -95,9 +156,12 @@ int do_rtnl_req(int nl, void *req, int size, int (*receive_callback)(struct nlms
 		msg.msg_iov = &iov;
 		msg.msg_iovlen = 1;
 
-		err = recvmsg(nl, &msg, 0);
+		err = rtnl_wait(nl, POLLIN, deadline);
+		if (err)
+			goto err;
+		err = recvmsg(nl, &msg, flags);
 		if (err < 0) {
-			if (errno == EINTR)
+			if (errno == EINTR || (deadline && errno == EAGAIN))
 				continue;
 			else {
 				err = -errno;
@@ -121,10 +185,23 @@ int do_rtnl_req(int nl, void *req, int size, int (*receive_callback)(struct nlms
 			break;
 	}
 
+	if (deadline) {
+		err = rtnl_remaining_ms(deadline);
+		if (err < 0)
+			goto err;
+	}
 	return 0;
 
 err:
+	if (err == -ETIMEDOUT)
+		pr_err("Netlink request timed out\n");
 	return err;
+}
+
+int do_rtnl_req(int nl, void *req, int size, int (*receive_callback)(struct nlmsghdr *h, struct ns_id *ns, void *),
+		int (*error_callback)(int err, struct ns_id *ns, void *arg), struct ns_id *ns, void *arg)
+{
+	return do_rtnl_req_timeout(nl, req, size, receive_callback, error_callback, ns, arg, 0);
 }
 
 int addattr_l(struct nlmsghdr *n, int maxlen, int type, const void *data, int alen)
